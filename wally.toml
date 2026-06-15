@@ -1,0 +1,13 @@
+[package]
+name = "cluelessdev/replicated-table"
+description = "A small delta-compressed table replication helper for Roblox."
+version = "0.1.0-rc.1"
+license = "MIT"
+authors = ["Clueless_Dev"]
+realm = "shared"
+registry = "https://github.com/UpliftGames/wally-index"
+exclude = [
+    ".gitignore",
+    "default.project.json",
+    "docs",
+]

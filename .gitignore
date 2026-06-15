@@ -1,0 +1,8 @@
+/.vscode/
+/.idea/
+/*.rbxl
+/*.rbxlx
+/*.rbxm
+/*.rbxmx
+/sourcemap.json
+/wally.lock
