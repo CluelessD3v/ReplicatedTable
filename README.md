@@ -7,7 +7,9 @@ In plain terms: it is a wrapper around
 The server keeps normal Lua tables, mutates normal Lua tables, and the client
 reads normal Lua tables. ReplicatedTable handles the annoying middle part:
 diffing, buffering, remotes, initial sync, local cache updates, and change
-signals.
+signals. It also gives you simple accessor paths like `"chests.unopened"` so
+you can read, update, and listen to one nested part of a table without writing
+the same plumbing every time.
 
 It exists for people who want their game code to keep speaking in tables instead
 of passing compressed buffers around.
@@ -109,6 +111,7 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local ReplicatedTable = require(ReplicatedStorage.ReplicatedTable)
 
+-- These are the plain table shapes your game wants to work with.
 export type Chest = {
     kind: string,
     UID: string,
@@ -120,6 +123,8 @@ export type PlayerData = {
     },
 }
 
+-- Create one named replicated table handle.
+-- Server scripts and client scripts can both require this same module.
 local Replicas = {
     playerData = ReplicatedTable.new<PlayerData>("PlayerData"),
 }
@@ -139,6 +144,8 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Replicas = require(ReplicatedStorage.Replicas)
 
 Players.PlayerAdded:Connect(function(player)
+    -- Register the server-owned starting table for this player.
+    -- The default recipient rule sends player-owned data to that same player.
     Replicas.playerData.register(player, {
         chests = {
             unopened = {},
@@ -147,6 +154,7 @@ Players.PlayerAdded:Connect(function(player)
 end)
 
 Players.PlayerRemoving:Connect(function(player)
+    -- Clear the replicated table when this player's lifecycle ends.
     Replicas.playerData.unregister(player)
 end)
 ```
@@ -163,11 +171,15 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Replicas = require(ReplicatedStorage.Replicas)
 
 local function giveChest(player: Player, kind: string)
+    -- This is ordinary game data. No buffer, no packet shape, no serializer.
     local chest = {
         kind = kind,
         UID = HttpService:GenerateGUID(false),
     }
 
+    -- "chests.unopened" points at playerData.chests.unopened.
+    -- The callback mutates that nested table in place, so it does not need
+    -- to return anything.
     Replicas.playerData.update(player, "chests.unopened", function(unopened)
         table.insert(unopened, chest)
     end)
@@ -189,15 +201,19 @@ local Replicas = require(ReplicatedStorage.Replicas)
 
 local localPlayer = Players.LocalPlayer
 
+-- Render whatever UI you want from the replicated table data.
 local function renderChests(chests)
     for _, chest in chests do
         print(chest.kind, chest.UID)
     end
 end
 
+-- On the client, get yields once if the first snapshot has not arrived yet.
 local initialChests = Replicas.playerData.get(localPlayer, "chests.unopened") or {}
 renderChests(initialChests)
 
+-- changed fires locally whenever this nested value changes.
+-- Here, the UI can rerender from the new normal Lua table.
 Replicas.playerData.changed(localPlayer, "chests.unopened"):Connect(function(newChests, oldChests)
     renderChests(newChests or {})
 end)
@@ -224,14 +240,17 @@ type PlayerData = {
     },
 }
 
+-- The server creates the authoritative side of the named table.
 local playerData = ReplicatedTable.new<PlayerData>("PlayerData")
 
+-- Register this player's starting data.
 playerData.register(player, {
     chests = {
         unopened = {},
     },
 })
 
+-- Mutate a nested path. ReplicatedTable diffs and sends the change.
 playerData.update(player, "chests.unopened", function(unopened)
     table.insert(unopened, {
         kind = "Common",
@@ -250,10 +269,15 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local ReplicatedTable = require(ReplicatedStorage.ReplicatedTable)
 
 local localPlayer = Players.LocalPlayer
+
+-- The client creates a local handle with the same name.
+-- This handle reads mirrored data; it does not own authority.
 local playerData = ReplicatedTable.new<any>("PlayerData")
 
+-- Read the nested chest list as a normal Lua table.
 local chests = playerData.get(localPlayer, "chests.unopened") or {}
 
+-- React when the server changes that nested chest list.
 playerData.changed(localPlayer, "chests.unopened"):Connect(function(newChests, oldChests)
     print("Chest list changed", newChests, oldChests)
 end)
@@ -287,6 +311,33 @@ them.
 
 That naming is deliberate: a table is the data; a stream is the flow of updates
 for that data.
+
+### Accessors
+
+An accessor is a dot path into the root table.
+
+```lua
+playerData.get(player, "coins")
+playerData.get(player, "chests.unopened")
+playerData.update(player, "settings.audio.music", function(enabled)
+    return not enabled
+end)
+```
+
+Use an accessor when you want to read, replace, update, or observe one nested
+piece of data without touching the rest of the table directly.
+
+Passing `nil` as the accessor means "the root table":
+
+```lua
+local fullData = playerData.get(player, nil)
+```
+
+Numeric path segments become numeric keys, so `"items.1.name"` reads
+`items[1].name`.
+
+Accessors do not create missing tables. If you update `"settings.audio.music"`,
+then `settings` and `settings.audio` must already exist.
 
 ### `ReplicatedTable.new<T>(streamId: string): Stream<T>`
 
