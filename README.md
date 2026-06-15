@@ -9,19 +9,18 @@ reads normal Lua tables. ReplicatedTable handles the annoying middle part:
 diffing, buffering, remotes, initial sync, local cache updates, and change
 signals.
 
-It exists for people who want their game APIs to keep speaking in tables instead
-of passing compressed buffers through every service, view, and handler.
+It exists for people who want their game code to keep speaking in tables instead
+of passing compressed buffers around.
 
 ReplicatedTable is intentionally not:
 
 - a DataStore wrapper
 - a validation layer
 - a player-data framework
-- a global service facade
 - a replacement for gameplay events
 
-Your services still own state, rules, saving, validation, and public APIs.
-ReplicatedTable only mirrors selected tables from the server to allowed clients.
+It does not save data or validate gameplay rules. ReplicatedTable only mirrors
+selected tables from the server to allowed clients.
 
 ## Why Not Just DeltaCompress?
 
@@ -42,12 +41,12 @@ data.coins += 100
 local diff, updatedOld = DeltaCompress.diffMutable(old, data)
 ```
 
-That is clean and powerful. The downside is that every service has to decide how
+That is clean and powerful. The downside is that every feature has to decide how
 to store previous snapshots, when to create remotes, how to request initial state,
 how to apply incoming buffers on the client, and how to notify UI that one nested
 path changed.
 
-ReplicatedTable wraps that repeated work so your service code can stay closer to:
+ReplicatedTable wraps that repeated work so your code can stay closer to:
 
 ```lua
 playerData.update(player, "chests.unopened", function(unopened)
@@ -78,34 +77,14 @@ With Wally, this release candidate is authored as:
 ReplicatedTable = "cluelessdev/replicated-table@0.1.0-rc.1"
 ```
 
-## Core Idea
-
-A stream is a named route for one replicated data shape.
-
-For example, `"PlayerData"` can be one stream. Each player is an owner inside
-that stream, and each owner has one root table:
-
-```lua
-{
-    chests = {
-        unopened = {},
-    },
-    coins = 0,
-}
-```
-
-The stream is not the table itself. It is the utility that manages the server's
-authoritative table, the client's mirrored table, and the delta messages between
-them.
-
-That naming is deliberate: a table is the data; a stream is the flow of updates
-for that data.
-
 ## Example Usage: Player Chests
 
-Imagine your player earns chests while cutting trees, clearing a region, beating
-a beast, or opening a reward node. The server owns the actual chest data. The
-client only needs enough replicated state to draw the unopened chest UI.
+Imagine your player earns unopened chests by doing anything in your game:
+cutting trees, clearing an area, finishing a quest, opening a reward node, or
+whatever else fits your loop.
+
+The goal is simple: the server adds a chest to a table, and the client UI updates
+from that same table shape.
 
 When the player earns a chest, you want this flow:
 
@@ -114,13 +93,13 @@ When the player earns a chest, you want this flow:
 3. Client receives the delta and updates its local table cache.
 4. The chest UI rerenders from a normal Lua table.
 
-There are two common ways to organize the stream.
+There are two common ways to organize the code.
 
 ### Option A: Shared Replicas Module
 
-This is the recommended pattern for games with multiple services and views.
-Create the stream once in a shared module and require that module from both the
-server and the client.
+This is useful when multiple scripts need the same replicated table. Create it
+once in a shared module and require that module from both the server and the
+client.
 
 ```lua
 -- ReplicatedStorage/Replicas.luau
@@ -172,10 +151,10 @@ Players.PlayerRemoving:Connect(function(player)
 end)
 ```
 
-A server service can mutate only its slice of the table:
+Any server script can add a chest:
 
 ```lua
--- Server-side ChestService snippet
+-- Server-side give chest snippet
 --!strict
 
 local HttpService = game:GetService("HttpService")
@@ -224,12 +203,12 @@ Replicas.playerData.changed(localPlayer, "chests.unopened"):Connect(function(new
 end)
 ```
 
-### Option B: Direct Stream Creation
+### Option B: Direct ReplicatedTable Creation
 
-You can also create the same named stream in separate server and client files.
-This is fine for small projects or isolated tests.
+You can also create the same named ReplicatedTable handle in separate server and
+client files. This is fine for small projects or isolated tests.
 
-The important part is that the `streamId` matches.
+The important part is that the name matches.
 
 ```lua
 -- Server
@@ -281,11 +260,33 @@ end)
 ```
 
 Both files call `ReplicatedTable.new("PlayerData")`, but they are not creating
-two network systems. They are getting a local handle for the same named stream.
-The server handle owns authoritative data. The client handle owns mirrored data
-and local signals.
+two network systems. The server handle owns authoritative data. The client
+handle owns mirrored data and local signals.
 
 ## API
+
+### API Overview: Tables And Streams
+
+A stream is a named route for one replicated data shape.
+
+For example, `"PlayerData"` can be one stream. Each player is an owner inside
+that stream, and each owner has one root table:
+
+```lua
+{
+    chests = {
+        unopened = {},
+    },
+    coins = 0,
+}
+```
+
+The stream is not the table itself. It is the utility that manages the server's
+authoritative table, the client's mirrored table, and the delta messages between
+them.
+
+That naming is deliberate: a table is the data; a stream is the flow of updates
+for that data.
 
 ### `ReplicatedTable.new<T>(streamId: string): Stream<T>`
 
@@ -441,7 +442,7 @@ playerData.modify(player, loadedSaveData)
 ```
 
 Use `modify` when the whole root table changes. Prefer `set` or `update` for
-normal service-level changes.
+normal smaller changes.
 
 ## Data Shape
 
@@ -457,13 +458,13 @@ Use nil through `set`, `update`, or `unregister` when you want to clear a field
 or owner. As usual in Lua tables, nil means absence rather than a stored value.
 
 Prefer stable ids over runtime `Instance` references inside replicated tables.
-Keep Instances as owners or service-owned runtime entities, not as arbitrary
-values deep inside your data.
+Keep Instances as owners or deliberately registered runtime entities, not as
+arbitrary values deep inside your data.
 
 ## Practical Notes
 
 - Register data on the server before expecting client UI to read it.
-- Keep service events for actions, fanfare, and third-party reactions.
+- Keep gameplay events for actions, fanfare, and third-party reactions.
 - Use ReplicatedTable for self-state hydration, such as UI reading the local
   player's chest list.
 - Keep configs, validation, reward rolls, and persistence outside this module.
