@@ -77,6 +77,7 @@ const TRANSPORT_FOLDER_NAME = '_ReplicatedTable'
 const DELTA_EVENT_NAME = 'Delta'
 const GET_FUNCTION_NAME = 'Get'
 const ROOT_PATH = ''
+const TRANSPORT_WAIT_SECONDS = 30
 
 const streamsById: { [string]: StreamState } = {}
 const pendingDeltasByStreamId: { [string]: { { owner: Instance, diff: buffer } } } = {}
@@ -84,6 +85,14 @@ const pendingDeltasByStreamId: { [string]: { { owner: Instance, diff: buffer } }
 local transportFolder: Folder
 local deltaEvent: RemoteEvent
 local getFunction: RemoteFunction
+
+const function waitForTransportChild(parent: Instance, childName: string, className: string): Instance
+    const child = parent:WaitForChild(childName, TRANSPORT_WAIT_SECONDS)
+    assert(child, `[ReplicatedTable] timed out waiting for {childName} under {parent:GetFullName()}`)
+    assert(child:IsA(className), `[ReplicatedTable] {childName} under {parent:GetFullName()} must be a {className}`)
+
+    return child
+end
 
 if RunService:IsServer() then
     const existingFolder = script:FindFirstChild(TRANSPORT_FOLDER_NAME)
@@ -116,9 +125,9 @@ if RunService:IsServer() then
         getFunction.Parent = transportFolder
     end
 else
-    transportFolder = script:WaitForChild(TRANSPORT_FOLDER_NAME) :: Folder
-    deltaEvent = transportFolder:WaitForChild(DELTA_EVENT_NAME) :: RemoteEvent
-    getFunction = transportFolder:WaitForChild(GET_FUNCTION_NAME) :: RemoteFunction
+    transportFolder = waitForTransportChild(script, TRANSPORT_FOLDER_NAME, 'Folder') :: Folder
+    deltaEvent = waitForTransportChild(transportFolder, DELTA_EVENT_NAME, 'RemoteEvent') :: RemoteEvent
+    getFunction = waitForTransportChild(transportFolder, GET_FUNCTION_NAME, 'RemoteFunction') :: RemoteFunction
 end
 
 const function defaultRecipients(owner: Instance): { Player }
