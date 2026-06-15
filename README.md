@@ -293,8 +293,12 @@ handle owns mirrored data and local signals.
 
 A stream is a named route for one replicated data shape.
 
-For example, `"PlayerData"` can be one stream. Each player is an owner inside
-that stream, and each owner has one root table:
+Inside a stream, each table is stored under a stable key called `ownerOrUid`.
+That key can be a Roblox `Instance`, usually a `Player`, or it can be a string
+UID for shared or authored state.
+
+For example, `"PlayerData"` can be one stream. Each player can be a key inside
+that stream, and each key has one root table:
 
 ```lua
 {
@@ -303,6 +307,20 @@ that stream, and each owner has one root table:
     },
     coins = 0,
 }
+```
+
+String keys work for tables that are not owned by a player:
+
+```lua
+worldState.register("MainWorld", {
+    weather = "Clear",
+    activeEvent = nil,
+})
+
+regionState.register("Forest", {
+    unlocked = true,
+    treeCount = 180,
+})
 ```
 
 The stream is not the table itself. It is the utility that manages the server's
@@ -353,26 +371,27 @@ local worldState = ReplicatedTable.new<WorldState>("WorldState")
 The stream id is included in every internal remote payload so all streams can
 share one `RemoteEvent` and one `RemoteFunction`.
 
-### `stream.setRecipients(resolver: (owner: Instance) -> { Player })`
+### `stream.setRecipients(resolver: (ownerOrUid: OwnerOrUid) -> { Player })`
 
 Server only.
 
-Controls which players can receive each owner's data. By default, if the owner
-is a `Player`, only that player receives that owner's table.
+Controls which players can receive data for each key. By default, if the key is
+a `Player`, only that player receives that table. String keys have no automatic
+recipients, so shared tables should set a resolver.
 
 Use this for shared state or spectator-style visibility:
 
 ```lua
-worldState.setRecipients(function(owner)
+worldState.setRecipients(function(ownerOrUid)
     return Players:GetPlayers()
 end)
 ```
 
-### `stream.register(owner: Instance, data: T): T`
+### `stream.register(ownerOrUid: OwnerOrUid, data: T): T`
 
 Server only.
 
-Registers the authoritative root table for one owner and sends the first diff to
+Registers the authoritative root table for one key and sends the first diff to
 current recipients.
 
 ```lua
@@ -384,13 +403,14 @@ playerData.register(player, {
 })
 ```
 
-Use this at player join, entity spawn, or whenever an owner lifecycle begins.
+Use this at player join, entity spawn, shared world setup, or whenever a table
+lifecycle begins.
 
-### `stream.unregister(owner: Instance)`
+### `stream.unregister(ownerOrUid: OwnerOrUid)`
 
 Server only.
 
-Clears an owner from the stream and sends a final nil update to recipients.
+Clears a key from the stream and sends a final nil update to recipients.
 
 ```lua
 Players.PlayerRemoving:Connect(function(player)
@@ -398,9 +418,9 @@ Players.PlayerRemoving:Connect(function(player)
 end)
 ```
 
-Use this at player leave or entity despawn.
+Use this at player leave, entity despawn, or shared table teardown.
 
-### `stream.get(owner: Instance, accessor: string?): any?`
+### `stream.get(ownerOrUid: OwnerOrUid, accessor: string?): any?`
 
 Shared.
 
@@ -419,7 +439,7 @@ local unopened = playerData.get(player, "chests.unopened")
 Accessors are dot paths. Numeric segments are treated as numbers, so
 `"items.1.name"` reads `items[1].name`.
 
-### `stream.changed(owner: Instance, accessor: string?): NamedSignal`
+### `stream.changed(ownerOrUid: OwnerOrUid, accessor: string?): NamedSignal`
 
 Shared.
 
@@ -436,7 +456,7 @@ This is a local signal, not a separate remote. Server-side changes fire
 server-side listeners immediately. Client-side listeners fire when a delta is
 received and applied.
 
-### `stream.set(owner: Instance, accessor: string, value: any): T`
+### `stream.set(ownerOrUid: OwnerOrUid, accessor: string, value: any): T`
 
 Server only.
 
@@ -450,7 +470,7 @@ playerData.set(player, "settings.musicEnabled", false)
 Intermediate tables must already exist. ReplicatedTable does not create missing
 paths for you.
 
-### `stream.update(owner: Instance, accessor: string?, updater: (currentValue: any) -> any): T`
+### `stream.update(ownerOrUid: OwnerOrUid, accessor: string?, updater: (currentValue: any) -> any): T`
 
 Server only.
 
@@ -482,11 +502,11 @@ playerData.update(player, nil, function(data)
 end)
 ```
 
-### `stream.modify(owner: Instance, data: T): T`
+### `stream.modify(ownerOrUid: OwnerOrUid, data: T): T`
 
 Server only.
 
-Replaces the whole root table for a registered owner.
+Replaces the whole root table for a registered key.
 
 ```lua
 playerData.modify(player, loadedSaveData)
@@ -506,11 +526,12 @@ Replicated data must be compatible with Roblox remotes and DeltaCompress:
 - Roblox datatypes supported by DeltaCompress, such as vectors and CFrames
 
 Use nil through `set`, `update`, or `unregister` when you want to clear a field
-or owner. As usual in Lua tables, nil means absence rather than a stored value.
+or key. As usual in Lua tables, nil means absence rather than a stored value.
 
 Prefer stable ids over runtime `Instance` references inside replicated tables.
-Keep Instances as owners or deliberately registered runtime entities, not as
-arbitrary values deep inside your data.
+Use `Instance` values as stream keys only when they are stable in your context,
+such as `Player`; otherwise use string UIDs. Avoid arbitrary `Instance` values
+deep inside your replicated data.
 
 ## Practical Notes
 

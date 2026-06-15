@@ -13,7 +13,7 @@
     @class ReplicatedTable
 
     ReplicatedTable is a small server-to-client table replication helper for Roblox.
-    It creates named streams, tracks authoritative server tables by owner, sends
+    It creates named streams, tracks authoritative server tables by stable keys, sends
     delta-compressed snapshots to approved clients, and exposes
     accessor-based reads and change signals on both sides.
 
@@ -31,7 +31,8 @@ const DeltaCompress = require(script.DeltaCompress)
 const NamedSignal   = require(script.NamedSignal)
 
 type ChangedSignal = NamedSignal.Signal<(newData: any, oldData: any?) -> ()>
-type RecipientResolver = (owner: Instance) -> { Player }
+export type OwnerOrUid = Instance | string
+type RecipientResolver = (ownerOrUid: OwnerOrUid) -> { Player }
 type AccessorKey = string | number
 type AccessorUpdater = (currentValue: any) -> any
 
@@ -54,23 +55,23 @@ type AccessorUpdater = (currentValue: any) -> any
 ]=]
 export type Stream<T> = {
     setRecipients: (resolver: RecipientResolver) -> (),
-    register: (owner: Instance, data: T) -> T,
-    modify: (owner: Instance, data: T) -> T,
-    set: (owner: Instance, accessor: string, value: any) -> T,
-    update: (owner: Instance, accessor: string?, updater: AccessorUpdater) -> T,
-    unregister: (owner: Instance) -> (),
-    get: (owner: Instance, accessor: string?) -> any?,
-    changed: (owner: Instance, accessor: string?) -> ChangedSignal,
+    register: (ownerOrUid: OwnerOrUid, data: T) -> T,
+    modify: (ownerOrUid: OwnerOrUid, data: T) -> T,
+    set: (ownerOrUid: OwnerOrUid, accessor: string, value: any) -> T,
+    update: (ownerOrUid: OwnerOrUid, accessor: string?, updater: AccessorUpdater) -> T,
+    unregister: (ownerOrUid: OwnerOrUid) -> (),
+    get: (ownerOrUid: OwnerOrUid, accessor: string?) -> any?,
+    changed: (ownerOrUid: OwnerOrUid, accessor: string?) -> ChangedSignal,
 }
 
 type StreamState = {
     id: string,
     resolveRecipients: RecipientResolver,
-    authoritativeByOwner: { [Instance]: any },
-    sentSnapshotsByOwner: { [Instance]: { [Player]: any } },
-    signalSnapshotsByOwner: { [Instance]: any },
-    replicatedDataByOwner: { [Instance]: any },
-    signalsByOwner: { [Instance]: { [string]: ChangedSignal } },
+    authoritativeByOwner: { [any]: any },
+    sentSnapshotsByOwner: { [any]: { [Player]: any } },
+    signalSnapshotsByOwner: { [any]: any },
+    replicatedDataByOwner: { [any]: any },
+    signalsByOwner: { [any]: { [string]: ChangedSignal } },
 }
 
 const TRANSPORT_FOLDER_NAME = '_ReplicatedTable'
@@ -80,7 +81,7 @@ const ROOT_PATH = ''
 const TRANSPORT_WAIT_SECONDS = 30
 
 const streamsById: { [string]: StreamState } = {}
-const pendingDeltasByStreamId: { [string]: { { owner: Instance, diff: buffer } } } = {}
+const pendingDeltasByStreamId: { [string]: { { ownerOrUid: OwnerOrUid, diff: buffer } } } = {}
 
 local transportFolder: Folder
 local deltaEvent: RemoteEvent
@@ -130,13 +131,21 @@ else
     getFunction = waitForTransportChild(transportFolder, GET_FUNCTION_NAME, 'RemoteFunction') :: RemoteFunction
 end
 
-const function defaultRecipients(owner: Instance): { Player }
-    if owner:IsA('Player') then
-        return { owner :: Player }
+const function defaultRecipients(ownerOrUid: OwnerOrUid): { Player }
+    if typeof(ownerOrUid) == 'Instance' and ownerOrUid:IsA('Player') then
+        return { ownerOrUid :: Player }
     end
 
     const nobody: { Player } = {}
     return nobody
+end
+
+const function describeOwnerOrUid(ownerOrUid: OwnerOrUid): string
+    if typeof(ownerOrUid) == 'Instance' then
+        return ownerOrUid:GetFullName()
+    end
+
+    return ownerOrUid
 end
 
 const function copyDeep(value: any): any
@@ -204,9 +213,9 @@ const function resolveAccessorParent(data: any, accessor: string): ({ [any]: any
     return current, path[#path]
 end
 
-const function getRegisteredData(stream: StreamState, owner: Instance): any
-    const data = stream.authoritativeByOwner[owner]
-    assert(data ~= nil, `[ReplicatedTable] {owner:GetFullName()} is not registered in stream {stream.id}`)
+const function getRegisteredData(stream: StreamState, ownerOrUid: OwnerOrUid): any
+    const data = stream.authoritativeByOwner[ownerOrUid]
+    assert(data ~= nil, `[ReplicatedTable] {describeOwnerOrUid(ownerOrUid)} is not registered in stream {stream.id}`)
 
     return data
 end
@@ -256,19 +265,19 @@ const function isSame(left: any, right: any): boolean
     return true
 end
 
-const function getOwnerSignals(stream: StreamState, owner: Instance): { [string]: ChangedSignal }
+const function getOwnerSignals(stream: StreamState, ownerOrUid: OwnerOrUid): { [string]: ChangedSignal }
     local ownerSignals: { [string]: ChangedSignal }?
-    ownerSignals = stream.signalsByOwner[owner]
+    ownerSignals = stream.signalsByOwner[ownerOrUid]
     if ownerSignals then return ownerSignals end
 
     ownerSignals = {}
-    stream.signalsByOwner[owner] = ownerSignals
+    stream.signalsByOwner[ownerOrUid] = ownerSignals
 
     return ownerSignals
 end
 
-const function fireChanged(stream: StreamState, owner: Instance, oldData: any, newData: any)
-    const ownerSignals = stream.signalsByOwner[owner]
+const function fireChanged(stream: StreamState, ownerOrUid: OwnerOrUid, oldData: any, newData: any)
+    const ownerSignals = stream.signalsByOwner[ownerOrUid]
     if not ownerSignals then return end
 
     for accessorKey, signal in ownerSignals do
@@ -281,8 +290,8 @@ const function fireChanged(stream: StreamState, owner: Instance, oldData: any, n
     end
 end
 
-const function canReceive(stream: StreamState, player: Player, owner: Instance): boolean
-    for _, recipient in stream.resolveRecipients(owner) do
+const function canReceive(stream: StreamState, player: Player, ownerOrUid: OwnerOrUid): boolean
+    for _, recipient in stream.resolveRecipients(ownerOrUid) do
         if recipient == player then
             return true
         end
@@ -291,12 +300,12 @@ const function canReceive(stream: StreamState, player: Player, owner: Instance):
     return false
 end
 
-const function applyDelta(stream: StreamState, owner: Instance, diff: buffer)
-    const oldData = stream.replicatedDataByOwner[owner]
+const function applyDelta(stream: StreamState, ownerOrUid: OwnerOrUid, diff: buffer)
+    const oldData = stream.replicatedDataByOwner[ownerOrUid]
     const newData = DeltaCompress.applyImmutable(oldData, diff)
 
-    stream.replicatedDataByOwner[owner] = newData
-    fireChanged(stream, owner, oldData, newData)
+    stream.replicatedDataByOwner[ownerOrUid] = newData
+    fireChanged(stream, ownerOrUid, oldData, newData)
 end
 
 const function flushPendingDeltas(stream: StreamState)
@@ -305,30 +314,30 @@ const function flushPendingDeltas(stream: StreamState)
 
     pendingDeltasByStreamId[stream.id] = nil
     for _, pendingDelta in pendingDeltas do
-        applyDelta(stream, pendingDelta.owner, pendingDelta.diff)
+        applyDelta(stream, pendingDelta.ownerOrUid, pendingDelta.diff)
     end
 end
 
-const function fire(stream: StreamState, owner: Instance, newData: any)
+const function fire(stream: StreamState, ownerOrUid: OwnerOrUid, newData: any)
     assert(RunService:IsServer(), '[ReplicatedTable] fire can only run on the server')
 
-    const oldSignalData = stream.signalSnapshotsByOwner[owner]
+    const oldSignalData = stream.signalSnapshotsByOwner[ownerOrUid]
     const oldSignalDataCopy = copyDeep(oldSignalData)
     const signalDiff, updatedSignalData = DeltaCompress.diffMutable(oldSignalData, newData)
     if signalDiff then
-        stream.signalSnapshotsByOwner[owner] = updatedSignalData
-        fireChanged(stream, owner, oldSignalDataCopy, newData)
+        stream.signalSnapshotsByOwner[ownerOrUid] = updatedSignalData
+        fireChanged(stream, ownerOrUid, oldSignalDataCopy, newData)
     end
 
     local sentSnapshots: { [Player]: any }?
-    sentSnapshots = stream.sentSnapshotsByOwner[owner]
+    sentSnapshots = stream.sentSnapshotsByOwner[ownerOrUid]
     if not sentSnapshots then
         sentSnapshots = {}
-        stream.sentSnapshotsByOwner[owner] = sentSnapshots
+        stream.sentSnapshotsByOwner[ownerOrUid] = sentSnapshots
     end
 
     const currentRecipients: { [Player]: boolean } = {}
-    for _, player in stream.resolveRecipients(owner) do
+    for _, player in stream.resolveRecipients(ownerOrUid) do
         currentRecipients[player] = true
 
         const oldRecipientData = sentSnapshots[player]
@@ -336,7 +345,7 @@ const function fire(stream: StreamState, owner: Instance, newData: any)
         if not diff then continue end
 
         sentSnapshots[player] = updatedRecipientData
-        deltaEvent:FireClient(player, stream.id, owner, diff)
+        deltaEvent:FireClient(player, stream.id, ownerOrUid, diff)
     end
 
     for player in sentSnapshots do
@@ -347,19 +356,19 @@ const function fire(stream: StreamState, owner: Instance, newData: any)
 end
 
 if RunService:IsServer() then
-    getFunction.OnServerInvoke = function(player: Player, streamId: string, owner: Instance): buffer?
+    getFunction.OnServerInvoke = function(player: Player, streamId: string, ownerOrUid: OwnerOrUid): buffer?
         const stream = streamsById[streamId]
         if not stream then return nil end
-        if not canReceive(stream, player, owner) then return nil end
+        if not canReceive(stream, player, ownerOrUid) then return nil end
 
-        const data = stream.authoritativeByOwner[owner]
+        const data = stream.authoritativeByOwner[ownerOrUid]
         if data == nil then return nil end
 
         local sentSnapshots: { [Player]: any }?
-        sentSnapshots = stream.sentSnapshotsByOwner[owner]
+        sentSnapshots = stream.sentSnapshotsByOwner[ownerOrUid]
         if not sentSnapshots then
             sentSnapshots = {}
-            stream.sentSnapshotsByOwner[owner] = sentSnapshots
+            stream.sentSnapshotsByOwner[ownerOrUid] = sentSnapshots
         end
 
         const diff, updatedRecipientData = DeltaCompress.diffMutable(nil, data)
@@ -368,10 +377,10 @@ if RunService:IsServer() then
         return diff
     end
 else
-    deltaEvent.OnClientEvent:Connect(function(streamId: string, owner: Instance, diff: buffer)
+    deltaEvent.OnClientEvent:Connect(function(streamId: string, ownerOrUid: OwnerOrUid, diff: buffer)
         const stream = streamsById[streamId]
         if not stream then
-            local pendingDeltas: { { owner: Instance, diff: buffer } }?
+            local pendingDeltas: { { ownerOrUid: OwnerOrUid, diff: buffer } }?
             pendingDeltas = pendingDeltasByStreamId[streamId]
             if not pendingDeltas then
                 pendingDeltas = {}
@@ -379,13 +388,13 @@ else
             end
 
             table.insert(pendingDeltas, {
-                owner = owner,
+                ownerOrUid = ownerOrUid,
                 diff = diff,
             })
             return
         end
 
-        applyDelta(stream, owner, diff)
+        applyDelta(stream, ownerOrUid, diff)
     end)
 end
 
@@ -434,14 +443,14 @@ function ReplicatedTable.new<T>(streamId: string): Stream<T>
     --[=[
         Sets the server-side recipient resolver for this stream.
 
-        The resolver receives an owner and returns the players allowed to receive
-        that owner's data. It is checked before sending deltas and before serving
+        The resolver receives an ownerOrUid and returns the players allowed to receive
+        data for that key. It is checked before sending deltas and before serving
         an initial snapshot through client `get`.
 
-        The default resolver only returns `{ owner }` when the owner is a `Player`.
+        The default resolver only returns `{ ownerOrUid }` when the key is a `Player`.
 
         @within Stream
-        @param resolver (owner: Instance) -> { Player } -- Server-side visibility rule.
+        @param resolver (ownerOrUid: OwnerOrUid) -> { Player } -- Server-side visibility rule.
         @return ()
     ]=]
     function streamApi.setRecipients(resolver: RecipientResolver)
@@ -451,84 +460,84 @@ function ReplicatedTable.new<T>(streamId: string): Stream<T>
     end
 
     --[=[
-        Registers authoritative data for an owner.
+        Registers authoritative data for a stable key.
 
-        Use this for first setup, such as player registration or entity spawn.
-        Registering clears old per-recipient snapshots for that owner, stores the
+        Use this for first setup, such as player data, shared world data, or entity spawn.
+        Registering clears old per-recipient snapshots for that key, stores the
         provided table as authoritative data, and sends a baseline diff to current
         recipients.
 
-        Calling `register` again for the same owner replaces the previous baseline
+        Calling `register` again for the same key replaces the previous baseline
         and should be treated as a full lifecycle reset.
 
         @within Stream
-        @param owner Instance -- Stable owner key, usually a `Player`.
+        @param ownerOrUid OwnerOrUid -- Stable key for this table, usually a `Player` or string UID.
         @param data T -- Authoritative table to mirror.
         @return T -- The registered table.
     ]=]
-    function streamApi.register(owner: Instance, data: T): T
+    function streamApi.register(ownerOrUid: OwnerOrUid, data: T): T
         assert(RunService:IsServer(), '[ReplicatedTable] register can only run on the server')
 
-        streamState.authoritativeByOwner[owner] = data
-        streamState.sentSnapshotsByOwner[owner] = nil
-        streamState.signalSnapshotsByOwner[owner] = nil
-        fire(streamState, owner, data)
+        streamState.authoritativeByOwner[ownerOrUid] = data
+        streamState.sentSnapshotsByOwner[ownerOrUid] = nil
+        streamState.signalSnapshotsByOwner[ownerOrUid] = nil
+        fire(streamState, ownerOrUid, data)
 
         return data
     end
 
     --[=[
-        Replaces the whole authoritative table for a registered owner.
+        Replaces the whole authoritative table for a registered key.
 
-        This is the broad write API. It asserts if the owner was not registered,
+        This is the broad write API. It asserts if the key was not registered,
         stores the new root table, and sends one delta to current recipients.
 
         Use `set` or `update` when only a small accessor path changed.
 
         @within Stream
-        @param owner Instance -- Registered owner whose data should be replaced.
+        @param ownerOrUid OwnerOrUid -- Registered key whose data should be replaced.
         @param data T -- New authoritative root table.
         @return T -- The new authoritative table.
     ]=]
-    function streamApi.modify(owner: Instance, data: T): T
+    function streamApi.modify(ownerOrUid: OwnerOrUid, data: T): T
         assert(RunService:IsServer(), '[ReplicatedTable] modify can only run on the server')
-        getRegisteredData(streamState, owner)
+        getRegisteredData(streamState, ownerOrUid)
 
-        streamState.authoritativeByOwner[owner] = data
-        fire(streamState, owner, data)
+        streamState.authoritativeByOwner[ownerOrUid] = data
+        fire(streamState, ownerOrUid, data)
 
         return data
     end
 
     --[=[
-        Replaces one accessor path inside a registered owner's table.
+        Replaces one accessor path inside a registered table.
 
         Accessors are dot paths such as `"stats.coins"` or
         `"chests.ownedChests.1"`. Numeric segments are converted to numbers.
         Intermediate tables must already exist; ReplicatedTable does not create
         missing table paths.
 
-        Use `modify` to replace the root table. Use `set(owner, path, nil)` when
+        Use `modify` to replace the root table. Use `set(ownerOrUid, path, nil)` when
         intentionally clearing a value.
 
         @within Stream
-        @param owner Instance -- Registered owner whose data should be changed.
+        @param ownerOrUid OwnerOrUid -- Registered key whose data should be changed.
         @param accessor string -- Dot path to replace.
         @param value any -- Value to store at the accessor.
-        @return T -- The owner's updated root table.
+        @return T -- The updated root table.
     ]=]
-    function streamApi.set(owner: Instance, accessor: string, value: any): T
+    function streamApi.set(ownerOrUid: OwnerOrUid, accessor: string, value: any): T
         assert(RunService:IsServer(), '[ReplicatedTable] set can only run on the server')
 
-        const data = getRegisteredData(streamState, owner)
+        const data = getRegisteredData(streamState, ownerOrUid)
         const updatedData = setAccessorValue(data, accessor, value)
-        fire(streamState, owner, updatedData)
+        fire(streamState, ownerOrUid, updatedData)
 
         return updatedData
     end
 
     --[=[
-        Updates one accessor path inside a registered owner's table.
+        Updates one accessor path inside a registered table.
 
         The current accessor value is passed to `updater`. If `updater` returns a
         non-nil value, that value replaces the accessor target. If it returns
@@ -539,82 +548,82 @@ function ReplicatedTable.new<T>(streamId: string): Stream<T>
         root-table case, a non-nil updater return replaces the root table.
 
         @within Stream
-        @param owner Instance -- Registered owner whose data should be changed.
+        @param ownerOrUid OwnerOrUid -- Registered key whose data should be changed.
         @param accessor string? -- Dot path to update; nil means the root table.
         @param updater (currentValue: any) -> any -- Mutation/replacement callback.
-        @return T -- The owner's updated root table.
+        @return T -- The updated root table.
     ]=]
-    function streamApi.update(owner: Instance, accessor: string?, updater: AccessorUpdater): T
+    function streamApi.update(ownerOrUid: OwnerOrUid, accessor: string?, updater: AccessorUpdater): T
         assert(RunService:IsServer(), '[ReplicatedTable] update can only run on the server')
 
-        const data = getRegisteredData(streamState, owner)
+        const data = getRegisteredData(streamState, ownerOrUid)
         const updatedData = updateAccessorValue(data, accessor, updater)
-        streamState.authoritativeByOwner[owner] = updatedData
-        fire(streamState, owner, updatedData)
+        streamState.authoritativeByOwner[ownerOrUid] = updatedData
+        fire(streamState, ownerOrUid, updatedData)
 
         return updatedData
     end
 
     --[=[
-        Removes an owner from this stream.
+        Removes a key from this stream.
 
         Unregistering clears authoritative data, recipient snapshots, and local
-        server-side changed signals for the owner. Current recipients receive a
+        server-side changed signals for the key. Current recipients receive a
         final nil delta so their mirrored root value becomes nil.
 
         Use this during player removal or entity despawn.
 
         @within Stream
-        @param owner Instance -- Owner to remove.
+        @param ownerOrUid OwnerOrUid -- Key to remove.
         @return ()
     ]=]
-    function streamApi.unregister(owner: Instance)
+    function streamApi.unregister(ownerOrUid: OwnerOrUid)
         assert(RunService:IsServer(), '[ReplicatedTable] unregister can only run on the server')
 
-        streamState.authoritativeByOwner[owner] = nil
-        fire(streamState, owner, nil)
-        streamState.sentSnapshotsByOwner[owner] = nil
-        streamState.signalSnapshotsByOwner[owner] = nil
-        streamState.signalsByOwner[owner] = nil
+        streamState.authoritativeByOwner[ownerOrUid] = nil
+        fire(streamState, ownerOrUid, nil)
+        streamState.sentSnapshotsByOwner[ownerOrUid] = nil
+        streamState.signalSnapshotsByOwner[ownerOrUid] = nil
+        streamState.signalsByOwner[ownerOrUid] = nil
     end
 
     --[=[
-        Reads replicated data for an owner.
+        Reads replicated data for a key.
 
         On the server, this reads the authoritative table. On the client, this
         reads the local cache. If no client cache exists yet, `get` invokes the
         shared `Get` `RemoteFunction` once and yields until the server responds.
 
-        This returns nil if the owner is not registered, if the local player is
+        This returns nil if the key is not registered, if the local player is
         not a recipient, or if the accessor cannot be resolved.
 
         @within Stream
-        @param owner Instance -- Owner whose data should be read.
+        @param ownerOrUid OwnerOrUid -- Key whose data should be read.
         @param accessor string? -- Dot path to read; nil returns the root table.
         @return any? -- The root table or accessor value, if available.
     ]=]
-    function streamApi.get(owner: Instance, accessor: string?): any?
+    function streamApi.get(ownerOrUid: OwnerOrUid, accessor: string?): any?
         local data: any
         if RunService:IsServer() then
-            data = streamState.authoritativeByOwner[owner]
+            data = streamState.authoritativeByOwner[ownerOrUid]
         else
-            const cachedData = streamState.replicatedDataByOwner[owner]
+            const cachedData = streamState.replicatedDataByOwner[ownerOrUid]
             if cachedData ~= nil then
                 return readAccessor(cachedData, accessor)
             end
 
-            const diff = getFunction:InvokeServer(streamState.id, owner) :: buffer?
+            const diff = getFunction:InvokeServer(streamState.id, ownerOrUid) :: buffer?
             if not diff then return nil end
 
-            applyDelta(streamState, owner, diff)
-            data = streamState.replicatedDataByOwner[owner]
+            applyDelta(streamState, ownerOrUid, diff)
+            data = streamState.replicatedDataByOwner[ownerOrUid]
         end
 
         return readAccessor(data, accessor)
     end
 
     --[=[
-        Returns a local change signal for an owner and optional accessor.
+        Returns a local change signal for a key and optional accessor.
 
         Signals are local to the current VM. They are not separate Roblox remotes.
         A listener receives `(newValue, oldValue)` whenever the root table or
@@ -624,13 +633,13 @@ function ReplicatedTable.new<T>(streamId: string): Stream<T>
         Passing nil for `accessor` listens to the whole root table.
 
         @within Stream
-        @param owner Instance -- Owner whose mirrored data should be observed.
+        @param ownerOrUid OwnerOrUid -- Key whose mirrored data should be observed.
         @param accessor string? -- Dot path to observe; nil observes the root table.
         @return NamedSignal -- Signal that fires with `(newValue, oldValue)`.
     ]=]
-    function streamApi.changed(owner: Instance, accessor: string?): ChangedSignal
+    function streamApi.changed(ownerOrUid: OwnerOrUid, accessor: string?): ChangedSignal
         const accessorKey = normalizeAccessor(accessor)
-        const ownerSignals = getOwnerSignals(streamState, owner)
+        const ownerSignals = getOwnerSignals(streamState, ownerOrUid)
         local signal: ChangedSignal?
         signal = ownerSignals[accessorKey]
         if signal then return signal end
