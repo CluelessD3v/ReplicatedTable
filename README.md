@@ -456,6 +456,26 @@ This is a local signal, not a separate remote. Server-side changes fire
 server-side listeners immediately. Client-side listeners fire when a delta is
 received and applied.
 
+### `stream.observe(ownerOrUid: OwnerOrUid, accessor: string?, callback: (newValue: any, oldValue: any?) -> ()): () -> ()`
+
+Shared.
+
+Connects to future changes and also calls the callback once with the current
+value. It returns a cleanup function that can be stored in a bin or called
+directly.
+
+```lua
+local cleanup = playerData.observe(player, "coins", function(newCoins, oldCoins)
+    print(`Coins changed from {oldCoins} to {newCoins}`)
+end)
+
+cleanup()
+```
+
+On the client, `observe` starts listening before reading the initial snapshot,
+so a delta that arrives during first hydration is not overwritten by a stale
+initial callback.
+
 ### `stream.set(ownerOrUid: OwnerOrUid, accessor: string, value: any): T`
 
 Server only.

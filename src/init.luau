@@ -35,6 +35,7 @@ export type OwnerOrUid = Instance | string
 type RecipientResolver = (ownerOrUid: OwnerOrUid) -> { Player }
 type AccessorKey = string | number
 type AccessorUpdater = (currentValue: any) -> any
+type ObserveCallback = (newData: any, oldData: any?) -> ()
 
 --[=[
     @type Stream
@@ -62,6 +63,7 @@ export type Stream<T> = {
     unregister: (ownerOrUid: OwnerOrUid) -> (),
     get: (ownerOrUid: OwnerOrUid, accessor: string?) -> any?,
     changed: (ownerOrUid: OwnerOrUid, accessor: string?) -> ChangedSignal,
+    observe: (ownerOrUid: OwnerOrUid, accessor: string?, callback: ObserveCallback) -> (() -> ()),
 }
 
 type StreamState = {
@@ -71,6 +73,7 @@ type StreamState = {
     sentSnapshotsByOwner: { [any]: { [Player]: any } },
     signalSnapshotsByOwner: { [any]: any },
     replicatedDataByOwner: { [any]: any },
+    snapshotReadyByOwner: { [any]: boolean },
     signalsByOwner: { [any]: { [string]: ChangedSignal } },
 }
 
@@ -78,7 +81,7 @@ const TRANSPORT_FOLDER_NAME = '_ReplicatedTable'
 const DELTA_EVENT_NAME = 'Delta'
 const GET_FUNCTION_NAME = 'Get'
 const ROOT_PATH = ''
-const TRANSPORT_WAIT_SECONDS = 30
+const TRANSPORT_WAIT_SECONDS = 7
 
 const streamsById: { [string]: StreamState } = {}
 const pendingDeltasByStreamId: { [string]: { { ownerOrUid: OwnerOrUid, diff: buffer } } } = {}
@@ -86,6 +89,10 @@ const pendingDeltasByStreamId: { [string]: { { ownerOrUid: OwnerOrUid, diff: buf
 local transportFolder: Folder
 local deltaEvent: RemoteEvent
 local getFunction: RemoteFunction
+
+const function ownerDeparted(ownerOrUid: OwnerOrUid): boolean
+    return typeof(ownerOrUid) == 'Instance' and ownerOrUid:IsA('Player') and ownerOrUid.Parent == nil
+end
 
 const function waitForTransportChild(parent: Instance, childName: string, className: string): Instance
     const child = parent:WaitForChild(childName, TRANSPORT_WAIT_SECONDS)
@@ -305,7 +312,35 @@ const function applyDelta(stream: StreamState, ownerOrUid: OwnerOrUid, diff: buf
     const newData = DeltaCompress.applyImmutable(oldData, diff)
 
     stream.replicatedDataByOwner[ownerOrUid] = newData
+    stream.snapshotReadyByOwner[ownerOrUid] = true
     fireChanged(stream, ownerOrUid, oldData, newData)
+end
+
+const function waitForClientSnapshot(stream: StreamState, ownerOrUid: OwnerOrUid): any?
+    if stream.snapshotReadyByOwner[ownerOrUid] then
+        return stream.replicatedDataByOwner[ownerOrUid]
+    end
+
+    const deadline = os.clock() + TRANSPORT_WAIT_SECONDS
+    while os.clock() < deadline do
+        if stream.snapshotReadyByOwner[ownerOrUid] then
+            return stream.replicatedDataByOwner[ownerOrUid]
+        end
+
+        const diff = getFunction:InvokeServer(stream.id, ownerOrUid) :: buffer?
+        if diff then
+            applyDelta(stream, ownerOrUid, diff)
+            return stream.replicatedDataByOwner[ownerOrUid]
+        end
+
+        if ownerDeparted(ownerOrUid) then
+            return nil
+        end
+
+        task.wait()
+    end
+
+    return nil
 end
 
 const function flushPendingDeltas(stream: StreamState)
@@ -429,6 +464,7 @@ function ReplicatedTable.new<T>(streamId: string): Stream<T>
             sentSnapshotsByOwner = {},
             signalSnapshotsByOwner = {},
             replicatedDataByOwner = {},
+            snapshotReadyByOwner = {},
             signalsByOwner = {},
         }
         streamsById[streamId] = streamState
@@ -591,11 +627,12 @@ function ReplicatedTable.new<T>(streamId: string): Stream<T>
         Reads replicated data for a key.
 
         On the server, this reads the authoritative table. On the client, this
-        reads the local cache. If no client cache exists yet, `get` invokes the
-        shared `Get` `RemoteFunction` once and yields until the server responds.
+        reads the local cache. If no client snapshot exists yet, `get` yields until
+        the server serves an initial diff, a pushed delta arrives, or the wait
+        budget expires.
 
         This returns nil if the key is not registered, if the local player is
-        not a recipient, or if the accessor cannot be resolved.
+        not a recipient, if the owner left, or if the accessor cannot be resolved.
 
         @within Stream
         @param ownerOrUid OwnerOrUid -- Key whose data should be read.
@@ -607,16 +644,8 @@ function ReplicatedTable.new<T>(streamId: string): Stream<T>
         if RunService:IsServer() then
             data = streamState.authoritativeByOwner[ownerOrUid]
         else
-            const cachedData = streamState.replicatedDataByOwner[ownerOrUid]
-            if cachedData ~= nil then
-                return readAccessor(cachedData, accessor)
-            end
-
-            const diff = getFunction:InvokeServer(streamState.id, ownerOrUid) :: buffer?
-            if not diff then return nil end
-
-            applyDelta(streamState, ownerOrUid, diff)
-            data = streamState.replicatedDataByOwner[ownerOrUid]
+            const data = waitForClientSnapshot(streamState, ownerOrUid)
+            return readAccessor(data, accessor)
         end
 
         return readAccessor(data, accessor)
@@ -648,6 +677,54 @@ function ReplicatedTable.new<T>(streamId: string): Stream<T>
         ownerSignals[accessorKey] = signal
 
         return signal
+    end
+
+    --[=[
+        Observes the current value and future changes for a key and optional accessor.
+
+        `observe` connects before queuing the initial snapshot read because
+        client-side `get` may yield during first hydration. The read runs in its
+        own task so callers can store the cleanup function immediately. If a
+        change arrives while the read is waiting, the change callback wins and
+        the initial callback is skipped to avoid replaying stale data.
+
+        @within Stream
+        @param ownerOrUid OwnerOrUid -- Key whose mirrored data should be observed.
+        @param accessor string? -- Dot path to observe; nil observes the root table.
+        @param callback ObserveCallback -- Receives `(newValue, oldValue)`.
+        @return () -> () -- Bin-compatible cleanup function.
+    ]=]
+    function streamApi.observe(ownerOrUid: OwnerOrUid, accessor: string?, callback: ObserveCallback): () -> ()
+        const observeState = {
+            alive = true,
+            receivedChange = false,
+        }
+        const connection = streamApi.changed(ownerOrUid, accessor):Connect(function(newData: any, oldData: any?)
+            if not observeState.alive then
+                return
+            end
+
+            observeState.receivedChange = true
+            callback(newData, oldData)
+        end)
+
+        task.spawn(function()
+            const currentData = streamApi.get(ownerOrUid, accessor)
+            if observeState.alive and not observeState.receivedChange then
+                callback(currentData, nil)
+            end
+        end)
+
+        const function cleanup()
+            if not observeState.alive then
+                return
+            end
+
+            observeState.alive = false
+            connection:Disconnect()
+        end
+
+        return cleanup
     end
 
     return streamApi :: Stream<T>
